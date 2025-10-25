@@ -35,6 +35,11 @@ The script accepts a few optional flags:
   if you process a large number of subscriptions.
 * `-o/--output`: location of the JSON file that will be produced. Defaults to
   `channel_links.json` in the current directory.
+* `-f/--filter`: limit collected links to those containing the provided
+  substring. Repeat the flag to match multiple substrings (e.g.
+  `-f facebook.com -f instagram.com`).
+* `--no-progress`: suppress the progress messages that are printed for each
+  processed channel.
 
 ## Example
 
