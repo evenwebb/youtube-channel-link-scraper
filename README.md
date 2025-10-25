@@ -34,7 +34,9 @@ The script accepts a few optional flags:
 * `--delay`: seconds to wait between requests (defaults to `0.5`). Increase this
   if you process a large number of subscriptions.
 * `-o/--output`: location of the JSON file that will be produced. Defaults to
-  `channel_links.json` in the current directory.
+  `channel_links.json` in the current directory. The file is created
+  immediately and updated after each processed channel so you can inspect
+  partial results if the run is interrupted.
 * `-f/--filter`: limit collected links to those containing the provided
   substring. Repeat the flag to match multiple substrings (e.g.
   `-f facebook.com -f instagram.com`).

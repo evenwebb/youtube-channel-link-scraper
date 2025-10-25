@@ -5,12 +5,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -161,57 +164,65 @@ def scrape_links(
     delay: float = 0.5,
     url_filters: Optional[list[str]] = None,
     progress: bool = True,
+    on_update: Optional[Callable[[list[dict[str, object]]], None]] = None,
 ) -> list[dict[str, object]]:
     results = []
     subscriptions_list = list(subscriptions)
     total = len(subscriptions_list)
     lowered_filters = [item.lower() for item in url_filters] if url_filters else None
-    for index, subscription in enumerate(subscriptions_list, start=1):
-        if progress:
-            print(
-                f"[{index}/{total}] Fetching links for {subscription.title!r}...",
-                flush=True,
-            )
-        try:
-            about_url = subscription.about_url
-        except ValueError:
-            print(f"Skipping {subscription.title!r}: missing channel URL", file=sys.stderr)
-            continue
-        try:
-            page_text = fetch_about_page(about_url)
-        except Exception as exc:  # noqa: BLE001 - continue processing the rest
-            print(f"Failed to fetch {about_url}: {exc}", file=sys.stderr)
-            continue
-        links = parse_channel_links(page_text)
-        if lowered_filters is not None:
-            links = [
-                link
-                for link in links
-                if any(filter_value in link.lower() for filter_value in lowered_filters)
-            ]
-        canonical_url = normalise_channel_url(subscription.url, subscription.channel_id)
-        results.append(
-            {
-                "channel_title": subscription.title,
-                "channel_url": canonical_url or subscription.url,
-                "links": links,
-            }
-        )
-        if progress:
-            if links:
+    try:
+        for index, subscription in enumerate(subscriptions_list, start=1):
+            if progress:
                 print(
-                    f"    Found {len(links)} link(s).",
+                    f"[{index}/{total}] Fetching links for {subscription.title!r}...",
                     flush=True,
                 )
-            else:
-                message = (
-                    "    No matching links found."
-                    if lowered_filters is not None
-                    else "    No links found."
-                )
-                print(message, flush=True)
-        if delay > 0 and index < len(subscriptions_list):
-            time.sleep(delay)
+            try:
+                about_url = subscription.about_url
+            except ValueError:
+                print(f"Skipping {subscription.title!r}: missing channel URL", file=sys.stderr)
+                continue
+            try:
+                page_text = fetch_about_page(about_url)
+            except Exception as exc:  # noqa: BLE001 - continue processing the rest
+                print(f"Failed to fetch {about_url}: {exc}", file=sys.stderr)
+                continue
+            links = parse_channel_links(page_text)
+            if lowered_filters is not None:
+                links = [
+                    link
+                    for link in links
+                    if any(filter_value in link.lower() for filter_value in lowered_filters)
+                ]
+            canonical_url = normalise_channel_url(subscription.url, subscription.channel_id)
+            results.append(
+                {
+                    "channel_title": subscription.title,
+                    "channel_url": canonical_url or subscription.url,
+                    "links": links,
+                }
+            )
+            if on_update is not None:
+                on_update(list(results))
+            if progress:
+                if links:
+                    print(
+                        f"    Found {len(links)} link(s).",
+                        flush=True,
+                    )
+                else:
+                    message = (
+                        "    No matching links found."
+                        if lowered_filters is not None
+                        else "    No links found."
+                    )
+                    print(message, flush=True)
+            if delay > 0 and index < len(subscriptions_list):
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        if progress:
+            print("\nInterrupted by user, saving collected links...", flush=True)
+        return results
     return results
 
 
@@ -259,15 +270,40 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not subscriptions:
         print("No subscriptions found in the provided CSV.", file=sys.stderr)
         return 1
+    output_path = Path(args.output)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"Unable to prepare output directory {output_path.parent}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    def write_results(data: list[dict[str, object]]) -> None:
+        output_dir = output_path.parent
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            delete=False,
+            dir=str(output_dir) if output_dir else None,
+        ) as tmp_handle:
+            json.dump(data, tmp_handle, ensure_ascii=False, indent=2)
+            tmp_name = tmp_handle.name
+        os.replace(tmp_name, output_path)
+
+    # Touch the output file early so users can see where results will be stored.
+    write_results([])
+
     results = scrape_links(
         subscriptions,
         delay=max(args.delay, 0.0),
         url_filters=args.filters,
         progress=not args.no_progress,
+        on_update=write_results,
     )
-    with open(args.output, "w", encoding="utf-8") as handle:
-        json.dump(results, handle, ensure_ascii=False, indent=2)
-    print(f"Saved channel links for {len(results)} channels to {args.output}")
+    write_results(results)
+    print(f"Saved channel links for {len(results)} channels to {output_path.resolve()}")
     return 0
 
 
