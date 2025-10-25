@@ -104,7 +104,8 @@ def normalise_channel_url(url: str, channel_id: Optional[str] = None) -> Optiona
 def fetch_about_page(about_url: str, timeout: int = 30) -> str:
     target = f"{PROXY_PREFIX}{about_url}"
     req = urllib.request.Request(target, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    opener = urllib.request.build_opener()
+    with opener.open(req, timeout=timeout) as response:
         body = response.read().decode("utf-8", errors="replace")
     return body
 
