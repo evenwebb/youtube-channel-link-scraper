@@ -9,9 +9,11 @@ import os
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional
 
@@ -24,6 +26,40 @@ USER_AGENT = (
 REDIRECT_PREFIX = "https://www.youtube.com/redirect"
 YOUTUBE_ORIGIN = "https://www.youtube.com"
 PROXY_PREFIX = "https://r.jina.ai/"
+RATE_LIMIT_REQUESTS_PER_MINUTE = 20
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+RETRY_DELAY_SECONDS = 30.0
+
+_request_timestamps: deque[float] = deque()
+
+
+def _wait_for_rate_limit() -> None:
+    """Block until a request can be made without exceeding the rate limit."""
+
+    if RATE_LIMIT_REQUESTS_PER_MINUTE <= 0:
+        return
+
+    while True:
+        now = time.time()
+        # Remove timestamps older than our tracking window.
+        while _request_timestamps and now - _request_timestamps[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            _request_timestamps.popleft()
+
+        if len(_request_timestamps) < RATE_LIMIT_REQUESTS_PER_MINUTE:
+            return
+
+        wait_time = RATE_LIMIT_WINDOW_SECONDS - (now - _request_timestamps[0])
+        if wait_time > 0:
+            time.sleep(wait_time)
+        else:
+            # Allow other events to progress before re-checking.
+            time.sleep(0)
+
+
+def _record_request(timestamp: float) -> None:
+    if RATE_LIMIT_REQUESTS_PER_MINUTE <= 0:
+        return
+    _request_timestamps.append(timestamp)
 
 
 def _normalise_column_name(name: str) -> str:
@@ -105,9 +141,29 @@ def fetch_about_page(about_url: str, timeout: int = 30, use_proxy: bool = True) 
     target = f"{PROXY_PREFIX}{about_url}" if use_proxy else about_url
     req = urllib.request.Request(target, headers={"User-Agent": USER_AGENT})
     opener = urllib.request.build_opener()
-    with opener.open(req, timeout=timeout) as response:
-        body = response.read().decode("utf-8", errors="replace")
-    return body
+
+    while True:
+        if use_proxy:
+            _wait_for_rate_limit()
+            _record_request(time.time())
+        try:
+            with opener.open(req, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+            return body
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                retry_seconds = int(RETRY_DELAY_SECONDS)
+                print(
+                    (
+                        f"Received HTTP 429 when fetching {about_url}. "
+                        f"Retrying in {retry_seconds} seconds..."
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise
 
 
 def _iter_redirect_urls(page_text: str) -> Iterable[str]:
