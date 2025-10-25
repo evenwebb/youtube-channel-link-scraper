@@ -101,10 +101,15 @@ def normalise_channel_url(url: str, channel_id: Optional[str] = None) -> Optiona
     return base
 
 
-def fetch_about_page(about_url: str, timeout: int = 30) -> str:
-    target = f"{PROXY_PREFIX}{about_url}"
+def fetch_about_page(about_url: str, timeout: int = 30, use_proxy: bool = True) -> str:
+    target = f"{PROXY_PREFIX}{about_url}" if use_proxy else about_url
     req = urllib.request.Request(target, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    if use_proxy:
+        opener = urllib.request.build_opener()
+    else:
+        # Disable environment proxy settings to avoid corporate proxies that block YouTube.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as response:
         body = response.read().decode("utf-8", errors="replace")
     return body
 
@@ -164,6 +169,7 @@ def scrape_links(
     delay: float = 0.5,
     url_filters: Optional[list[str]] = None,
     progress: bool = True,
+    use_proxy: bool = True,
     on_update: Optional[Callable[[list[dict[str, object]]], None]] = None,
 ) -> list[dict[str, object]]:
     results = []
@@ -183,7 +189,7 @@ def scrape_links(
                 print(f"Skipping {subscription.title!r}: missing channel URL", file=sys.stderr)
                 continue
             try:
-                page_text = fetch_about_page(about_url)
+                page_text = fetch_about_page(about_url, use_proxy=use_proxy)
             except Exception as exc:  # noqa: BLE001 - continue processing the rest
                 print(f"Failed to fetch {about_url}: {exc}", file=sys.stderr)
                 continue
@@ -256,6 +262,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable progress output.",
     )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Fetch YouTube pages directly instead of via https://r.jina.ai/.",
+    )
     return parser.parse_args(argv)
 
 
@@ -300,6 +311,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         delay=max(args.delay, 0.0),
         url_filters=args.filters,
         progress=not args.no_progress,
+        use_proxy=not args.no_proxy,
         on_update=write_results,
     )
     write_results(results)
