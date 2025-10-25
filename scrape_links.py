@@ -27,8 +27,8 @@ REDIRECT_PREFIX = "https://www.youtube.com/redirect"
 YOUTUBE_ORIGIN = "https://www.youtube.com"
 PROXY_PREFIX = "https://r.jina.ai/"
 RATE_LIMIT_REQUESTS_PER_MINUTE = 20
-RATE_LIMIT_WINDOW_SECONDS = 60.0
-RETRY_DELAY_SECONDS = 30.0
+RATE_LIMIT_WINDOW_SECONDS = 62.0
+RETRY_DELAY_SECONDS = 5.0
 
 _request_timestamps: deque[float] = deque()
 
@@ -314,11 +314,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable progress output.",
     )
-    parser.add_argument(
-        "--no-proxy",
-        action="store_true",
-        help="Fetch YouTube pages directly instead of via https://r.jina.ai/.",
-    )
+    
     return parser.parse_args(argv)
 
 
