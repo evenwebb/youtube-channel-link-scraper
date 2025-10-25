@@ -1,10 +1,6 @@
 # YouTube Channel Link Scraper
 
-A small Python utility that reads the `subscriptions.csv` file exported by Google Takeout 
-and resolves every subscribed channel's external links (Patreon, Twitter, merch stores, etc.). 
-The links are collected from each channel's **About** page and saved into a single JSON file 
-so you can quickly locate creators on their other platforms without opening the channel pages 
-one at a time.
+A small Python utility that reads the `subscriptions.csv` file exported by Google Takeout and resolves every subscribed channel's external links (Patreon, Twitter, merch stores, etc.). The links are collected from each channel's **About** page and saved into a single JSON file so you can quickly locate creators on their other platforms without opening the channel pages one at a time.
 
 The scraper relies on the [`r.jina.ai`](https://r.jina.ai) proxy to fetch public
 YouTube pages because direct access to youtube.com is often rate-limited or
