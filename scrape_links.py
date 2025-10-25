@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import sys
 import time
@@ -129,7 +130,8 @@ def parse_channel_links(page_text: str) -> List[str]:
 
     structured: list[tuple[str, str, int]] = []
     for idx, raw_url in enumerate(_iter_redirect_urls(page_text)):
-        parsed = urllib.parse.urlparse(raw_url)
+        unescaped = html.unescape(raw_url)
+        parsed = urllib.parse.urlparse(unescaped)
         params = urllib.parse.parse_qs(parsed.query)
         targets = params.get("q")
         if not targets:
