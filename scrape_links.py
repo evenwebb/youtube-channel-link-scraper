@@ -156,10 +156,22 @@ def parse_channel_links(page_text: str) -> List[str]:
     return links
 
 
-def scrape_links(subscriptions: Iterable[Subscription], delay: float = 0.5) -> list[dict[str, object]]:
+def scrape_links(
+    subscriptions: Iterable[Subscription],
+    delay: float = 0.5,
+    url_filters: Optional[list[str]] = None,
+    progress: bool = True,
+) -> list[dict[str, object]]:
     results = []
     subscriptions_list = list(subscriptions)
+    total = len(subscriptions_list)
+    lowered_filters = [item.lower() for item in url_filters] if url_filters else None
     for index, subscription in enumerate(subscriptions_list, start=1):
+        if progress:
+            print(
+                f"[{index}/{total}] Fetching links for {subscription.title!r}...",
+                flush=True,
+            )
         try:
             about_url = subscription.about_url
         except ValueError:
@@ -171,6 +183,12 @@ def scrape_links(subscriptions: Iterable[Subscription], delay: float = 0.5) -> l
             print(f"Failed to fetch {about_url}: {exc}", file=sys.stderr)
             continue
         links = parse_channel_links(page_text)
+        if lowered_filters is not None:
+            links = [
+                link
+                for link in links
+                if any(filter_value in link.lower() for filter_value in lowered_filters)
+            ]
         canonical_url = normalise_channel_url(subscription.url, subscription.channel_id)
         results.append(
             {
@@ -179,6 +197,19 @@ def scrape_links(subscriptions: Iterable[Subscription], delay: float = 0.5) -> l
                 "links": links,
             }
         )
+        if progress:
+            if links:
+                print(
+                    f"    Found {len(links)} link(s).",
+                    flush=True,
+                )
+            else:
+                message = (
+                    "    No matching links found."
+                    if lowered_filters is not None
+                    else "    No links found."
+                )
+                print(message, flush=True)
         if delay > 0 and index < len(subscriptions_list):
             time.sleep(delay)
     return results
@@ -199,6 +230,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=0.5,
         help="Delay (in seconds) between requests to avoid overwhelming the proxy",
     )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        dest="filters",
+        action="append",
+        help=(
+            "Only include links that contain the provided substring. "
+            "Can be supplied multiple times to match any of the given values."
+        ),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress output.",
+    )
     return parser.parse_args(argv)
 
 
@@ -213,7 +259,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not subscriptions:
         print("No subscriptions found in the provided CSV.", file=sys.stderr)
         return 1
-    results = scrape_links(subscriptions, delay=max(args.delay, 0.0))
+    results = scrape_links(
+        subscriptions,
+        delay=max(args.delay, 0.0),
+        url_filters=args.filters,
+        progress=not args.no_progress,
+    )
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(results, handle, ensure_ascii=False, indent=2)
     print(f"Saved channel links for {len(results)} channels to {args.output}")
