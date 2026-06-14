@@ -6,17 +6,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html as _html_mod
 import json
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -142,6 +145,29 @@ def normalise_channel_url(url: str, channel_id: Optional[str] = None) -> Optiona
         cid = channel_id.strip()
         base = f"{YOUTUBE_ORIGIN}/channel/{cid}"
     return base
+
+
+def resolve_channel_id(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[str]:
+    """Follow a YouTube /@handle redirect to extract the real channel ID."""
+    if "/channel/" in url:
+        match = re.search(r"/channel/([^/?#]+)", url)
+        return match.group(1) if match else None
+    if "/@" not in url and "/c/" not in url and "/user/" not in url:
+        return None
+    req = urllib.request.Request(
+        url if "://" in url else f"{YOUTUBE_ORIGIN}{url}",
+        headers={"User-Agent": USER_AGENT},
+        method="HEAD",
+    )
+    try:
+        with _make_opener().open(req, timeout=timeout) as resp:
+            final_url = resp.geturl()
+        match = re.search(r"/channel/([^/?#]+)", final_url)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
 
 
 # --- Subscription model ---------------------------------------------------------
@@ -322,6 +348,68 @@ class ScrapeResult:
     error: str | None = None
 
 
+def _scrape_one_channel(
+    args: tuple[int, Subscription],
+    *,
+    timeout: int,
+    use_proxy: bool,
+    max_retries: int,
+    rate_limiter: SlidingWindowRateLimiter | None,
+    url_filters: list[str] | None,
+    resume_from: set[str] | None,
+    on_error: Callable[[str, str], None] | None,
+    progress: bool,
+    total: int,
+) -> tuple[int, dict[str, object] | None, str | None, str | None]:
+    index, subscription = args
+    if progress:
+        print(f"[{index}/{total}] Fetching links for {subscription.title!r}...", flush=True)
+
+    if resume_from is not None and subscription.title in resume_from:
+        if progress:
+            print("    Already scraped, skipping.", flush=True)
+        return (index, None, None, "_skipped")
+
+    try:
+        about_url = subscription.about_url
+    except ValueError:
+        if on_error:
+            on_error(subscription.title, "Missing channel URL")
+        return (index, None, "Missing channel URL", None)
+
+    try:
+        page_text = fetch_about_page(
+            about_url, timeout=timeout, use_proxy=use_proxy,
+            rate_limiter=rate_limiter, max_retries=max_retries,
+        )
+    except (_FETCH_ERRORS, urllib.error.HTTPError) as exc:
+        err = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else str(exc)
+        if on_error:
+            on_error(subscription.title, err)
+        return (index, None, err, None)
+
+    links = parse_channel_links(page_text)
+    if url_filters:
+        links = [link for link in links if any(f in link.lower() for f in url_filters)]
+
+    categories = [categorise_link(link) for link in links]
+    canonical_url = normalise_channel_url(subscription.url, subscription.channel_id)
+    result = {
+        "channel_title": subscription.title,
+        "channel_url": canonical_url or subscription.url,
+        "links": links,
+        "categories": categories,
+    }
+    if progress:
+        if links:
+            unique_cats = {c for c in categories if c}
+            cat_str = f" ({', '.join(sorted(unique_cats))})" if unique_cats else ""
+            print(f"    Found {len(links)} link(s){cat_str}.", flush=True)
+        else:
+            print(f"    No links found.", flush=True)
+    return (index, result, None, None)
+
+
 def scrape_links(
     subscriptions: Iterable[Subscription],
     *,
@@ -332,6 +420,7 @@ def scrape_links(
     progress: bool = True,
     use_proxy: bool = True,
     max_retries: int = DEFAULT_RETRIES,
+    workers: int = 1,
     rate_limiter: SlidingWindowRateLimiter | None = None,
     on_update: Callable[[list[dict[str, object]]], None] | None = None,
     on_error: Callable[[str, str], None] | None = None,
@@ -340,7 +429,6 @@ def scrape_links(
     results: list[dict[str, object]] = []
     subscriptions_list = list(subscriptions)
 
-    # Apply channel filter
     if channel_filter:
         lower_filter = channel_filter.lower()
         subscriptions_list = [
@@ -351,7 +439,6 @@ def scrape_links(
             print(f"No channels matching '{channel_filter}'", file=sys.stderr)
             return results
 
-    # Apply limit
     if limit is not None and limit > 0:
         subscriptions_list = subscriptions_list[:limit]
 
@@ -360,85 +447,67 @@ def scrape_links(
     skipped_count = 0
     error_count = 0
     start_time = time.monotonic()
+    results_lock = threading.Lock()
 
-    try:
-        for index, subscription in enumerate(subscriptions_list, start=1):
+    if workers <= 1:
+        try:
+            for index, subscription in enumerate(subscriptions_list, start=1):
+                _, result, error, _skip = _scrape_one_channel(
+                    (index, subscription),
+                    timeout=timeout, use_proxy=use_proxy, max_retries=max_retries,
+                    rate_limiter=rate_limiter, url_filters=lowered_filters,
+                    resume_from=resume_from, on_error=on_error,
+                    progress=progress, total=total,
+                )
+                if result is not None:
+                    with results_lock:
+                        results.append(result)
+                    if on_update is not None:
+                        on_update(list(results))
+                elif error:
+                    error_count += 1
+                elif _skip:
+                    skipped_count += 1
+        except KeyboardInterrupt:
             if progress:
-                print(
-                    f"[{index}/{total}] Fetching links for {subscription.title!r}...",
-                    flush=True,
+                print("\nInterrupted, saving collected links...", flush=True)
+            return results
+    else:
+        # Parallel mode with semaphore for rate limit
+        sem = threading.Semaphore(max(1, workers))
+        limiter_for_sem = rate_limiter
+        fetch_args = [
+            (i + 1, sub) for i, sub in enumerate(subscriptions_list)
+            if resume_from is None or sub.title not in resume_from
+        ]
+        remaining = len(subscriptions_list) - len(fetch_args)
+        skipped_count = remaining
+
+        def _fetch_with_sem(item: tuple[int, Subscription]) -> tuple[int, dict | None, str | None, str | None]:
+            with sem:
+                return _scrape_one_channel(
+                    item, timeout=timeout, use_proxy=use_proxy, max_retries=max_retries,
+                    rate_limiter=limiter_for_sem, url_filters=lowered_filters,
+                    resume_from=None, on_error=on_error, progress=progress,
+                    total=total,
                 )
 
-            # Resume: skip already-scraped channels
-            if resume_from is not None and subscription.title in resume_from:
-                if progress:
-                    print("    Already scraped, skipping.", flush=True)
-                skipped_count += 1
-                continue
-
-            try:
-                about_url = subscription.about_url
-            except ValueError:
-                print(f"Skipping {subscription.title!r}: missing channel URL", file=sys.stderr)
-                skipped_count += 1
-                if on_error:
-                    on_error(subscription.title, "Missing channel URL")
-                continue
-
-            try:
-                page_text = fetch_about_page(
-                    about_url, timeout=timeout,
-                    use_proxy=use_proxy, rate_limiter=rate_limiter,
-                    max_retries=max_retries,
-                )
-            except _FETCH_ERRORS as exc:
-                print(f"Failed to fetch {about_url}: {exc}", file=sys.stderr)
-                error_count += 1
-                if on_error:
-                    on_error(subscription.title, str(exc))
-                continue
-            except urllib.error.HTTPError as exc:
-                print(f"HTTP {exc.code} for {about_url}", file=sys.stderr)
-                error_count += 1
-                if on_error:
-                    on_error(subscription.title, f"HTTP {exc.code}")
-                continue
-
-            links = parse_channel_links(page_text)
-            if lowered_filters is not None:
-                links = [link for link in links if any(f in link.lower() for f in lowered_filters)]
-
-            categories = [categorise_link(link) for link in links]
-            canonical_url = normalise_channel_url(subscription.url, subscription.channel_id)
-            results.append({
-                "channel_title": subscription.title,
-                "channel_url": canonical_url or subscription.url,
-                "links": links,
-                "categories": categories,
-            })
-
-            if on_update is not None:
-                on_update(list(results))  # pass a shallow copy
-
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_fetch_with_sem, item): item for item in fetch_args}
+                for future in as_completed(futures):
+                    _, result, error, _skip = future.result()
+                    if result is not None:
+                        with results_lock:
+                            results.append(result)
+                        if on_update is not None:
+                            on_update(list(results))
+                    elif error:
+                        error_count += 1
+        except KeyboardInterrupt:
             if progress:
-                if links:
-                    cat_str = ""
-                    unique_cats = {c for c in categories if c}
-                    if unique_cats:
-                        cat_str = f" ({', '.join(sorted(unique_cats))})"
-                    print(f"    Found {len(links)} link(s){cat_str}.", flush=True)
-                else:
-                    msg = (
-                        "    No matching links found."
-                        if lowered_filters is not None
-                        else "    No links found."
-                    )
-                    print(msg, flush=True)
-
-    except KeyboardInterrupt:
-        if progress:
-            print("\nInterrupted by user, saving collected links...", flush=True)
-        return results
+                print("\nInterrupted, saving collected links...", flush=True)
+            return results
 
     elapsed = time.monotonic() - start_time
     if progress and total > 0:
@@ -448,6 +517,249 @@ def scrape_links(
               f"took {elapsed:.0f}s", flush=True)
 
     return results
+
+
+# --- Dead link checking ---------------------------------------------------------
+
+def check_links(
+    results: list[dict[str, object]],
+    *,
+    timeout: int = 15,
+    progress: bool = True,
+    workers: int = 10,
+) -> list[dict[str, object]]:
+    """HEAD-check every link and annotate results with status codes."""
+    # Collect all unique links
+    all_links: dict[str, tuple[int, int]] = {}  # url -> (channel_idx, link_idx)
+    for ci, ch in enumerate(results):
+        for li, link in enumerate(ch.get("links", [])):
+            if link not in all_links:
+                all_links[link] = (ci, li)
+
+    urls = list(all_links.keys())
+    total = len(urls)
+    if total == 0:
+        return results
+
+    if progress:
+        print(f"Checking {total} link(s) for dead/broken...", flush=True)
+
+    checked: dict[str, Optional[int]] = {}
+    lock = threading.Lock()
+    completed = 0
+
+    def _check_one(url: str) -> None:
+        nonlocal completed
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
+            with _make_opener().open(req, timeout=timeout) as resp:
+                code = resp.getcode()
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        except Exception:
+            code = None
+        with lock:
+            checked[url] = code
+            completed += 1
+            if progress and completed % 20 == 0:
+                print(f"  Checked {completed}/{total}...", flush=True)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(_check_one, urls))
+
+    # Annotate results
+    live_count = 0
+    dead_count = 0
+    for ch in results:
+        ch["link_statuses"] = []
+        for link in ch.get("links", []):
+            code = checked.get(link)
+            ch["link_statuses"].append(code)
+            if code and 200 <= code < 400:
+                live_count += 1
+            else:
+                dead_count += 1
+
+    if progress:
+        print(f"  {live_count} live, {dead_count} dead/broken", flush=True)
+
+    return results
+
+
+# --- Change diffing -------------------------------------------------------------
+
+def diff_links(
+    results: list[dict[str, object]],
+    previous_path: Path,
+) -> Optional[dict[str, dict[str, list[str]]]]:
+    """Compare current results against a previous JSON run. Returns {title: {added: [], removed: []}}."""
+    try:
+        prev = json.loads(previous_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+    prev_map: dict[str, set[str]] = {}
+    for ch in prev:
+        prev_map[ch.get("channel_title", "")] = set(ch.get("links", []))
+
+    diffs: dict[str, dict[str, list[str]]] = {}
+    for ch in results:
+        title = ch.get("channel_title", "")
+        current_links = set(ch.get("links", []))
+        prev_links = prev_map.get(title, set())
+        added = sorted(current_links - prev_links)
+        removed = sorted(prev_links - current_links)
+        if added or removed:
+            diffs[str(title)] = {"added": added, "removed": removed}
+    return diffs if diffs else None
+
+
+# --- HTML generation ------------------------------------------------------------
+
+_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>YouTube Channel Links</title>
+<style>
+:root{{--bg:#0f0f0f;--surface:#1a1a1a;--border:#333;--text:#e0e0e0;--muted:#999;--accent:#3ea6ff;--dead:#f87171;--live:#4ade80}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:2rem}}
+h1{{font-size:1.5rem;margin-bottom:.25rem}} .meta{{color:var(--muted);font-size:.85rem;margin-bottom:2rem}}
+.filters{{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem}}
+.filters input,.filters select{{padding:.5rem .75rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:.85rem}}
+.channel{{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-bottom:1rem}}
+.channel h2{{margin:0 0 .25rem;font-size:1.1rem}} .channel h2 a{{color:var(--accent);text-decoration:none}}
+.channel h2 a:hover{{text-decoration:underline}} .channel .url{{color:var(--muted);font-size:.8rem;margin-bottom:.75rem}}
+.links{{display:flex;flex-wrap:wrap;gap:.35rem}}
+.link{{display:inline-flex;align-items:center;gap:.3rem;padding:.25rem .6rem;border-radius:4px;font-size:.8rem;text-decoration:none;background:rgba(62,166,255,.1);color:var(--accent);border:1px solid rgba(62,166,255,.15)}}
+.link:hover{{background:rgba(62,166,255,.2)}}
+.link.dead{{background:rgba(248,113,113,.1);color:var(--dead);border-color:rgba(248,113,113,.2);text-decoration:line-through}}
+.cat{{font-size:.65rem;padding:1px 5px;border-radius:3px;background:rgba(255,255,255,.06);color:var(--muted);text-transform:uppercase;letter-spacing:.5px}}
+.sort-btn{{cursor:pointer;user-select:none;padding:.35rem .7rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:.8rem}}
+.sort-btn.active{{border-color:var(--accent);color:var(--accent)}}
+.diff-added{{background:rgba(74,222,128,.15)}} .diff-removed{{background:rgba(248,113,113,.15);text-decoration:line-through}}
+.summary{{display:flex;gap:1.5rem;margin-bottom:2rem;flex-wrap:wrap}}
+.summary-card{{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem 1.5rem;text-align:center}}
+.summary-card .num{{font-size:2rem;font-weight:700;color:var(--accent)}}
+.summary-card .label{{font-size:.75rem;color:var(--muted);text-transform:uppercase;margin-top:.25rem}}
+</style>
+</head>
+<body>
+<h1>YouTube Channel Links</h1>
+<p class="meta">{total_channels} channels &middot; {total_links} links &middot; generated {generated_at}</p>
+<div class="summary">{summary_cards}</div>
+<div class="filters">
+  <input type="search" id="search" placeholder="Filter channels or links..." oninput="filter()">
+  <select id="catFilter" onchange="filter()">
+    <option value="">All categories</option>{cat_options}
+  </select>
+  <button class="sort-btn active" onclick="sortChannels('default')">Default</button>
+  <button class="sort-btn" onclick="sortChannels('title')">A-Z</button>
+  <button class="sort-btn" onclick="sortChannels('links')">Most Links</button>
+</div>
+<div id="channels">{channel_html}</div>
+<script>
+function filter(){{var q=(document.getElementById('search').value||'').toLowerCase();var cat=document.getElementById('catFilter').value;document.querySelectorAll('.channel').forEach(function(c){{var text=c.textContent.toLowerCase();var matchCat=!cat||c.querySelectorAll('.cat').length==0||c.querySelector('.cat[data-cat='+CSS.escape(cat)+']');var matchSearch=!q||text.includes(q);c.style.display=matchSearch&&matchCat?'':'none'}})}}
+function sortChannels(mode){{document.querySelectorAll('.sort-btn').forEach(function(b){{b.classList.toggle('active',b.textContent.trim().toLowerCase().includes(mode))}});var container=document.getElementById('channels');var channels=Array.from(container.querySelectorAll('.channel'));if(mode==='title')channels.sort(function(a,b){{return(a.querySelector('h2 a').textContent||'').localeCompare(b.querySelector('h2 a').textContent||'')}});else if(mode==='links')channels.sort(function(a,b){{return b.querySelectorAll('.link').length-a.querySelectorAll('.link').length}});else channels.sort(function(a,b){{return parseInt(a.dataset.idx)-parseInt(b.dataset.idx)}});channels.forEach(function(c){{return container.appendChild(c)}})}}
+</script>
+</body>
+</html>"""
+
+
+def generate_html(
+    results: list[dict[str, object]],
+    output_path: Path,
+    *,
+    diff_data: Optional[dict[str, dict[str, list[str]]]] = None,
+) -> None:
+    """Generate a self-contained HTML page from scrape results."""
+    _esc = _html_mod.escape
+
+    total_links = sum(len(ch.get("links", [])) for ch in results)
+    all_cats: set[str] = set()
+    for ch in results:
+        for c in ch.get("categories", []):
+            if c:
+                all_cats.add(str(c))
+
+    cat_options = "\n".join(
+        f'<option value="{_esc(c)}">{_esc(c)}</option>' for c in sorted(all_cats)
+    )
+
+    dead_count = sum(
+        1 for ch in results
+        for s in (ch.get("link_statuses") or [])
+        if s is None or not (200 <= s < 400)
+    )
+
+    summary_cards = (
+        f'<div class="summary-card"><div class="num">{len(results)}</div><div class="label">Channels</div></div>'
+        f'<div class="summary-card"><div class="num">{total_links}</div><div class="label">Links</div></div>'
+        f'<div class="summary-card"><div class="num">{len(all_cats)}</div><div class="label">Categories</div></div>'
+    )
+    if dead_count > 0:
+        summary_cards += (
+            f'<div class="summary-card"><div class="num" style="color:var(--dead)">{dead_count}</div>'
+            f'<div class="label">Dead Links</div></div>'
+        )
+
+    channel_parts = []
+    for idx, ch in enumerate(results):
+        title = _esc(str(ch.get("channel_title", "")))
+        url = _esc(str(ch.get("channel_url", "")))
+        links = ch.get("links", [])
+        categories = ch.get("categories", [])
+        statuses = ch.get("link_statuses") or []
+        diff_info = (diff_data or {}).get(str(ch.get("channel_title", "")), {})
+
+        added = set(diff_info.get("added", []))
+        removed = set(diff_info.get("removed", []))
+
+        link_html_parts = []
+        for li, link in enumerate(links):
+            cat = categories[li] if li < len(categories) else None
+            status = statuses[li] if li < len(statuses) else None
+            is_dead = status is not None and not (200 <= status < 400)
+            classes = ["link"]
+            if is_dead:
+                classes.append("dead")
+            if link in added:
+                classes.append("diff-added")
+            if link in removed:
+                classes.append("diff-removed")
+
+            cat_tag = f'<span class="cat" data-cat="{_esc(cat or "")}">{_esc(cat or "other")}</span>' if cat else ""
+            link_html_parts.append(
+                f'<a href="{_esc(link)}" class="{" ".join(classes)}" target="_blank" rel="noopener">'
+                f'{_esc(link[:60] + ("..." if len(link) > 60 else ""))}{cat_tag}</a>'
+            )
+
+        links_html = "".join(link_html_parts) or '<span class="cat">No links</span>'
+        channel_parts.append(
+            f'<div class="channel" data-idx="{idx}">'
+            f'<h2><a href="{url}" target="_blank" rel="noopener">{title}</a></h2>'
+            f'<div class="url">{url}</div>'
+            f'<div class="links">{links_html}</div>'
+            f'</div>'
+        )
+
+    generated_at = _esc(time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()))
+    html = _HTML_TEMPLATE.format(
+        total_channels=len(results),
+        total_links=total_links,
+        generated_at=generated_at,
+        summary_cards=summary_cards,
+        cat_options=cat_options,
+        channel_html="\n".join(channel_parts),
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", delete=False, dir=str(output_path.parent)
+    ) as tmp:
+        tmp.write(html)
+        os.replace(tmp.name, output_path)
 
 
 # --- Output formats -------------------------------------------------------------
@@ -492,17 +804,28 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("subscriptions_csv", help="Path to Google Takeout subscriptions.csv")
     parser.add_argument("-o", "--output", default="channel_links.json",
-                        help="Destination file (.json or .csv)")
+                        help="Destination file (.json, .csv, or .html)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                         help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                         help=f"Max retries for transient errors (default: {DEFAULT_RETRIES})")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel workers for scraping (default: 1)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Only scrape the first N channels")
     parser.add_argument("--channel", dest="channel_filter", default=None,
                         help="Only scrape channels whose title or URL contains this string")
+    parser.add_argument("--sort", dest="sort_order", default=None,
+                        choices=["title", "links", "categories"],
+                        help="Sort output by title, link count, or category count")
     parser.add_argument("-f", "--filter", dest="filters", action="append",
                         help="Only include links containing this substring (can repeat)")
+    parser.add_argument("--check-links", action="store_true",
+                        help="HEAD-check every link and annotate with HTTP status")
+    parser.add_argument("--diff", dest="diff_path", default=None,
+                        help="Compare against a previous JSON output and show changes")
+    parser.add_argument("--html", action="store_true",
+                        help="Also generate an HTML output page")
     parser.add_argument("--dry-run", action="store_true",
                         help="List channels that would be scraped without making requests")
     parser.add_argument("--resume", action="store_true",
@@ -591,12 +914,49 @@ def main(argv: Optional[list[str]] = None) -> int:
         progress=not args.no_progress,
         use_proxy=not args.no_proxy,
         max_retries=args.retries,
+        workers=args.workers,
         rate_limiter=rate_limiter,
-        on_update=write_results,
+        on_update=write_results if args.workers <= 1 else None,
         on_error=on_error,
         resume_from=resume_from,
     )
+
+    # Sort results if requested
+    if args.sort_order == "title":
+        results.sort(key=lambda r: str(r.get("channel_title", "")).lower())
+    elif args.sort_order == "links":
+        results.sort(key=lambda r: len(r.get("links", [])), reverse=True)
+    elif args.sort_order == "categories":
+        results.sort(key=lambda r: len(set(c for c in r.get("categories", []) if c)), reverse=True)
+
+    # Dead link checking
+    if args.check_links:
+        results = check_links(results, timeout=min(args.timeout, 15), progress=not args.no_progress)
+
+    # Change diffing
+    diff_data = None
+    if args.diff_path:
+        diff_data = diff_links(results, Path(args.diff_path))
+        if diff_data:
+            print(f"\nChanges from {args.diff_path}:")
+            for title, changes in diff_data.items():
+                if changes["added"]:
+                    for link in changes["added"]:
+                        print(f"  + [{title}] {link}")
+                if changes["removed"]:
+                    for link in changes["removed"]:
+                        print(f"  - [{title}] {link}")
+        else:
+            print(f"\nNo changes from {args.diff_path}")
+
+    # Write main output
     write_results(results)
+
+    # Generate HTML page
+    if args.html or output_path.suffix.lower() == ".html":
+        html_path = output_path.with_suffix(".html")
+        generate_html(results, html_path, diff_data=diff_data)
+        print(f"Generated HTML page at {html_path.resolve()}")
 
     # Write error log if requested
     if args.error_log and error_entries:
