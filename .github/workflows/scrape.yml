@@ -1,0 +1,38 @@
+name: Scrape Channel Links
+
+on:
+  schedule:
+    - cron: '0 6 * * 0'  # Weekly on Sunday at 6am UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Scrape links
+        run: |
+          python scrape_links.py sample_subscriptions.csv -o docs/links.json --resume --error-log docs/errors.json
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "chore: update scraped links [skip ci]"
+            git push
+          fi
