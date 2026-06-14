@@ -20,7 +20,7 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -338,15 +338,6 @@ def parse_channel_links(page_text: str) -> list[str]:
 
 
 # --- Main scraping logic --------------------------------------------------------
-
-@dataclass
-class ScrapeResult:
-    channel_title: str
-    channel_url: str
-    links: list[str] = field(default_factory=list)
-    categories: list[str | None] = field(default_factory=list)
-    error: str | None = None
-
 
 def _scrape_one_channel(
     args: tuple[int, Subscription],
