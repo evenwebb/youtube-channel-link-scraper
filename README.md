@@ -47,8 +47,12 @@ Pages are fetched through the public **[r.jina.ai](https://r.jina.ai)** reader p
 | **Resumable-friendly** | Output JSON is written after **each** channel so partial runs are not lost. |
 | **Filtering** | `-f` / `--filter` to keep only URLs matching substrings (repeatable, OR logic). |
 | **Direct or proxy** | `--no-proxy` to hit YouTube directly when you accept stricter rate limits. |
+| **Parallel scraping** | `-w` / `--workers` for concurrent channel processing with configurable parallelism. |
+| **HTML output** | `--html` generates a styled HTML report alongside the Markdown output. |
+| **Dead link checking** | `--check-links` verifies each extracted URL and flags broken links. |
+| **Change diffing** | `--diff` shows which links were added/removed since the last scrape. |
 | **No pip deps** | Single `scrape_links.py`, Python standard library only. |
-| **Tested** | `unittest` suite under `tests/` (no pytest required). |
+| **Tested** | `unittest` suite under `tests/`, plus CI workflow with Dependabot. |
 
 ---
 
