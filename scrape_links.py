@@ -43,7 +43,8 @@ RATE_LIMIT_WINDOW_SECONDS = 62.0
 RETRY_DELAY_SECONDS = 5.0
 RETRY_BACKOFF_MULTIPLIER = 2.0
 
-_REDIRECT_URL_RE = re.compile(r"https://www\.youtube\.com/redirect[^\s)]+")
+_REDIRECT_URL_RE = re.compile(r"https://www\.youtube\.com/redirect[^\s)\"]+")
+_JSON_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 # --- Link categorisation --------------------------------------------------------
 
@@ -316,12 +317,15 @@ def parse_channel_links(page_text: str) -> list[str]:
     """Decode youtube.com/redirect targets and order by on-page section priority."""
     structured: list[tuple[str, str, int]] = []
     for idx, raw_url in enumerate(_iter_redirect_urls(page_text)):
+        raw_url = _JSON_UNICODE_ESCAPE_RE.sub(
+            lambda m: chr(int(m.group(1), 16)), raw_url
+        )
         parsed = urllib.parse.urlparse(raw_url)
         params = urllib.parse.parse_qs(parsed.query)
         targets = params.get("q")
         if not targets:
             continue
-        dest = urllib.parse.unquote(targets[0])
+        dest = targets[0]
         event = params.get("event", [""])[0]
         structured.append((event, dest, idx))
 
@@ -373,7 +377,7 @@ def _scrape_one_channel(
             about_url, timeout=timeout, use_proxy=use_proxy,
             rate_limiter=rate_limiter, max_retries=max_retries,
         )
-    except (_FETCH_ERRORS, urllib.error.HTTPError) as exc:
+    except (*_FETCH_ERRORS, urllib.error.HTTPError) as exc:
         err = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else str(exc)
         if on_error:
             on_error(subscription.title, err)

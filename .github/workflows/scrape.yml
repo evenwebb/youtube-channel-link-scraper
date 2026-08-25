@@ -23,7 +23,7 @@ jobs:
 
       - name: Scrape links
         run: |
-          python scrape_links.py sample_subscriptions.csv -o docs/links.json --resume --error-log docs/errors.json
+          python scrape_links.py sample_subscriptions.csv -o docs/links.json --resume --no-proxy --error-log docs/errors.json
 
       - name: Commit & push
         run: |
